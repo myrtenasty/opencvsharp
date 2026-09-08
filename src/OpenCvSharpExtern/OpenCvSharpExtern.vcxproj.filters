@@ -76,6 +76,9 @@
     <ClCompile Include="superres.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="surface_matching.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="stitching.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -217,6 +220,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="superres.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="surface_matching.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ml_SVM.h">
