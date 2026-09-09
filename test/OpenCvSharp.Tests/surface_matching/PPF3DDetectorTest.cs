@@ -6,6 +6,93 @@ namespace OpenCvSharp.Tests.SurfaceMatching;
 
 public class PPF3DDetectorTest : TestBase
 {
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(double.NaN)]
+    [InlineData(double.PositiveInfinity)]
+    public void PreparedRejectsInvalidScalarParameters(double value)
+    {
+        using var model = CreateDenseSlopedPlane(7, 5);
+        using var detector = new PPF3DDetector();
+        Assert.Throws<ArgumentOutOfRangeException>(() => detector.TrainPrepared(model, value));
+        Assert.Throws<ArgumentOutOfRangeException>(() => detector.TrainPrepared(model, 0.03, value));
+        Assert.Throws<ArgumentOutOfRangeException>(() => detector.MatchPrepared(model, value));
+        Assert.Throws<ArgumentOutOfRangeException>(() => detector.MatchPrepared(model, 0.2, value));
+    }
+
+    [Fact]
+    public void PreparedRejectsInvalidCloudsAndUntrainedModels()
+    {
+        using var model = CreateDenseSlopedPlane(7, 5);
+        using var detector = new PPF3DDetector();
+        Assert.Throws<OpenCVException>(() => detector.MatchPrepared(model));
+        Assert.Throws<ArgumentOutOfRangeException>(() => detector.MatchPrepared(model, 1.1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => detector.TrainPrepared(model, 0.03, 0.5));
+        using var wrongShape = new Mat(3, 3, MatType.CV_32FC1, Scalar.All(0));
+        Assert.Throws<OpenCVException>(() => detector.TrainPrepared(wrongShape, 0.03));
+        detector.TrainPrepared(model, 0.03);
+        model.Set(0, 5, 0f);
+        Assert.Throws<OpenCVException>(() => detector.TrainPrepared(model, 0.03));
+        Assert.Throws<OpenCVException>(() => detector.MatchPrepared(model));
+    }
+
+    [Fact]
+    public void PreparedOwnsTrainingCopyAndReturnedPosesOutliveDetector()
+    {
+        using var model = CreateDenseSlopedPlane(7, 5);
+        using var scene = model.Clone();
+        Pose3D[] results;
+        using (var detector = new PPF3DDetector())
+        {
+            detector.TrainPrepared(model, 0.03);
+            model.SetTo(Scalar.All(0));
+            results = detector.MatchPrepared(scene);
+        }
+
+        try
+        {
+            Assert.NotEmpty(results);
+            Assert.True(results[0].NumVotes > 0);
+            using var poseMatrix = results[0].Pose;
+            Assert.Equal(4, poseMatrix.Rows);
+        }
+        finally
+        {
+            foreach (var pose in results)
+                pose.Dispose();
+        }
+    }
+
+    [Fact]
+    public void PreparedPreservesEverySceneReferenceIncludingRemainder()
+    {
+        using var model = CreateDenseSlopedPlane(7, 6);
+        using var detector = new PPF3DDetector();
+        detector.TrainPrepared(model, 0.03);
+        detector.SetSearchParams(0, 0);
+        var results = detector.MatchPrepared(model, 0.2, 0.03);
+        try
+        {
+            Assert.Equal(9, results.Length);
+            Assert.All(results, pose => Assert.True(pose.NumVotes > 0));
+        }
+        finally
+        {
+            foreach (var pose in results)
+                pose.Dispose();
+        }
+    }
+
+    [Fact]
+    public void PreparedRejectsDifferentDistanceBins()
+    {
+        using var model = CreateDenseSlopedPlane(7, 5);
+        using var detector = new PPF3DDetector();
+        detector.TrainPrepared(model, 0.02);
+        Assert.Throws<OpenCVException>(() => detector.MatchPrepared(model, 0.2, 0.03));
+    }
+
     [Fact]
     public void TrainModelInsertsRepeatedFeaturesWithoutQuadraticScan()
     {

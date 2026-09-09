@@ -503,6 +503,30 @@ CVAPI(ExceptionStatus) surface_matching_PPF3DDetector_trainModel(
     });
 }
 
+CVAPI(ExceptionStatus) surface_matching_PPF3DDetector_trainPrepared(
+    cv::ppf_match_3d::PPF3DDetector* obj,
+    const interop::InputArrayProxy* modelPoints,
+    double distanceBinMetres,
+    double numberOfAngles)
+{
+    return cvTry([&] {
+        obj->trainPrepared(getMatFromProxy(*modelPoints), distanceBinMetres, numberOfAngles);
+    });
+}
+
+CVAPI(ExceptionStatus) surface_matching_PPF3DDetector_matchPrepared(
+    cv::ppf_match_3d::PPF3DDetector* obj,
+    const interop::InputArrayProxy* scenePoints,
+    std::vector<cv::ppf_match_3d::Pose3DPtr>* results,
+    double sceneReferenceFraction,
+    double distanceBinMetres)
+{
+    return cvTry([&] {
+        obj->matchPrepared(getMatFromProxy(*scenePoints), *results,
+            sceneReferenceFraction, distanceBinMetres);
+    });
+}
+
 CVAPI(ExceptionStatus) surface_matching_PPF3DDetector_match(
     cv::ppf_match_3d::PPF3DDetector* obj,
     const interop::InputArrayProxy* scene,

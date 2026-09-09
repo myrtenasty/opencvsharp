@@ -71,7 +71,7 @@ public sealed class PPF3DDetector : CvObject
     /// <summary>
     /// Configures thresholds used to cluster similar pose hypotheses.
     /// </summary>
-    /// <param name="positionThreshold">Translation similarity threshold. A negative value uses the model sampling step.</param>
+    /// <param name="positionThreshold">Translation similarity threshold, in metres for metre-based point clouds. A negative value uses the model sampling step.</param>
     /// <param name="rotationThreshold">Rotation similarity threshold in radians. A negative value uses the detector's angular discretization.</param>
     /// <param name="useWeightedClustering">Whether pose averaging is weighted by vote count.</param>
     public void SetSearchParams(
@@ -130,4 +130,55 @@ public sealed class PPF3DDetector : CvObject
         GC.KeepAlive(scene.Source);
         return results.ToArray();
     }
+    /// <summary>
+    /// Trains directly on prepared points without sampling or modifying their normals.
+    /// The detector owns a copy of the supplied model.
+    /// </summary>
+    /// <param name="modelPoints">N-by-6 CV_32F matrix with at least two rows: finite XYZ coordinates in metres followed by finite unit normals (squared-length tolerance 1e-4).</param>
+    /// <param name="distanceBinMetres">Finite positive feature distance bin in metres, independent of point spacing. Must also be supplied to MatchPrepared.</param>
+    /// <param name="numberOfAngles">Finite number of angular subdivisions, at least 1.</param>
+    public void TrainPrepared(InputArray modelPoints, double distanceBinMetres, double numberOfAngles = 30.0)
+    {
+        ThrowIfDisposed();
+        ValidatePositiveFinite(distanceBinMetres, nameof(distanceBinMetres));
+        ValidatePositiveFinite(numberOfAngles, nameof(numberOfAngles));
+        ArgumentOutOfRangeException.ThrowIfLessThan(numberOfAngles, 1);
+        NativeMethods.HandleException(
+            NativeMethods.surface_matching_PPF3DDetector_trainPrepared(
+                Handle, modelPoints.Proxy, distanceBinMetres, numberOfAngles));
+        GC.KeepAlive(modelPoints.Source);
+    }
+
+    /// <summary>
+    /// Matches prepared points without quantization using a model trained by TrainPrepared.
+    /// Every supplied scene row participates as a voting partner.
+    /// </summary>
+    /// <param name="scenePoints">N-by-6 CV_32F matrix with at least two rows: finite XYZ coordinates in metres followed by finite unit normals (squared-length tolerance 1e-4).</param>
+    /// <param name="sceneReferenceFraction">Dimensionless fraction in (0, 1]. Reference points use stride floor(1/fraction), capped at the scene row count.</param>
+    /// <param name="distanceBinMetres">Feature distance bin in metres. Must exactly equal the value supplied to TrainPrepared; mismatches are rejected.</param>
+    /// <returns>Pose hypotheses. The caller must dispose every returned pose, as with Match.</returns>
+    public Pose3D[] MatchPrepared(
+        InputArray scenePoints,
+        double sceneReferenceFraction = 0.2,
+        double distanceBinMetres = 0.03)
+    {
+        ThrowIfDisposed();
+        ValidatePositiveFinite(sceneReferenceFraction, nameof(sceneReferenceFraction));
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(sceneReferenceFraction, 1);
+        ValidatePositiveFinite(distanceBinMetres, nameof(distanceBinMetres));
+
+        using var results = new VectorOfPose3D();
+        NativeMethods.HandleException(
+            NativeMethods.surface_matching_PPF3DDetector_matchPrepared(
+                Handle, scenePoints.Proxy, results.Handle, sceneReferenceFraction, distanceBinMetres));
+        GC.KeepAlive(scenePoints.Source);
+        return results.ToArray();
+    }
+
+    private static void ValidatePositiveFinite(double value, string parameterName)
+    {
+        if (!double.IsFinite(value) || value <= 0)
+            throw new ArgumentOutOfRangeException(parameterName, value, "Must be finite and positive.");
+    }
+
 }

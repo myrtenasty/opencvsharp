@@ -265,6 +265,21 @@ static partial class NativeMethods
         double relativeSceneSampleStep,
         double relativeSceneDistance);
 
+    [LibraryImport(DllExtern), UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial ExceptionStatus surface_matching_PPF3DDetector_trainPrepared(
+        OpenCvSafeHandle obj,
+        in InputArrayProxy modelPoints,
+        double distanceBinMetres,
+        double numberOfAngles);
+
+    [LibraryImport(DllExtern), UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial ExceptionStatus surface_matching_PPF3DDetector_matchPrepared(
+        OpenCvSafeHandle obj,
+        in InputArrayProxy scenePoints,
+        OpenCvSafeHandle results,
+        double sceneReferenceFraction,
+        double distanceBinMetres);
+
     #endregion
 
     #region ICP

@@ -73,6 +73,23 @@ if (Test-Path $ppfPatch) {
     }
 }
 
+# Prepared point clouds depend on the multi-value hash patch above.
+$preparedPatch = "$RepoRoot/patches/opencv_contrib/0002-ppf-prepared-metre-bin.patch"
+git -C "$RepoRoot/opencv_contrib" apply --reverse --check $preparedPatch 2>$null
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "PPF prepared metre-bin patch already present."
+}
+else {
+    git -C "$RepoRoot/opencv_contrib" apply --check $preparedPatch
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cannot apply $preparedPatch to the current opencv_contrib checkout."
+    }
+    git -C "$RepoRoot/opencv_contrib" apply --whitespace=nowarn $preparedPatch
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to apply $preparedPatch"
+    }
+}
+
 $OpenCvVersion = (git -C "$RepoRoot/opencv" describe --tags --exact-match 2>$null)
 if (-not $OpenCvVersion) { $OpenCvVersion = (git -C "$RepoRoot/opencv" rev-parse --short HEAD) }
 Write-Host "OpenCV version: $OpenCvVersion"

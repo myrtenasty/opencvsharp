@@ -1,0 +1,302 @@
+diff --git a/modules/surface_matching/include/opencv2/surface_matching/ppf_match_3d.hpp b/modules/surface_matching/include/opencv2/surface_matching/ppf_match_3d.hpp
+index f1c9d6e44..7c2e9386c 100644
+--- a/modules/surface_matching/include/opencv2/surface_matching/ppf_match_3d.hpp
++++ b/modules/surface_matching/include/opencv2/surface_matching/ppf_match_3d.hpp
+@@ -143,6 +143,24 @@ public:
+     */
+   CV_WRAP void match(const Mat& scene, CV_OUT std::vector<Pose3DPtr> &results, const double relativeSceneSampleStep=1.0/5.0, const double relativeSceneDistance=0.03);
+ 
++  /**
++   * Train directly on prepared Nx6 CV_32F points (XYZ in metres, unit normals).
++   * No sampling or normal modification is performed. The model is copied.
++   * distanceBinMetres is a finite positive feature distance bin in metres.
++   * numberOfAngles is a finite number of angular subdivisions, at least 1.
++   */
++  CV_WRAP void trainPrepared(InputArray modelPoints, double distanceBinMetres, double numberOfAngles=30);
++
++  /**
++   * Match prepared Nx6 CV_32F points without quantization.
++   * sceneReferenceFraction is a dimensionless fraction in (0, 1]; references
++   * use the legacy stride floor(1/fraction), capped at the number of rows.
++   * All scene rows participate as voting partners.
++   * Requires trainPrepared and exactly the same distanceBinMetres.
++   */
++  CV_WRAP void matchPrepared(InputArray scenePoints, CV_OUT std::vector<Pose3DPtr>& results,
++                            double sceneReferenceFraction, double distanceBinMetres);
++
+   void read(const FileNode& fn);
+   void write(FileStorage& fs) const;
+ 
+@@ -164,12 +182,17 @@ protected:
+ private:
+   void computePPFFeatures(const Vec3d& p1, const Vec3d& n1,
+                           const Vec3d& p2, const Vec3d& n2,
+-                          Vec4d& f);
++                          Vec4d& f, bool prepared);
+ 
+   bool matchPose(const Pose3D& sourcePose, const Pose3D& targetPose);
+ 
+   void clusterPoses(std::vector<Pose3DPtr>& poseList, int numPoses, std::vector<Pose3DPtr> &finalPoses);
+ 
++  void trainPoints(const Mat& points, double distanceStep, bool prepared);
++  void matchPoints(const Mat& points, std::vector<Pose3DPtr>& results,
++                   int referenceStride, bool prepared);
++
++  bool prepared_training = false;
+   bool trained;
+ };
+ 
+diff --git a/modules/surface_matching/src/c_utils.hpp b/modules/surface_matching/src/c_utils.hpp
+index 1ed2e9f5b..516f3ef7f 100644
+--- a/modules/surface_matching/src/c_utils.hpp
++++ b/modules/surface_matching/src/c_utils.hpp
+@@ -71,7 +71,7 @@ static inline void TNormalize3(Vec3d& v)
+  *  \param [in] b normalized vector
+  *  \return angle between a and b vectors in radians
+  */
+-static inline double TAngle3Normalized(const Vec3d& a, const Vec3d& b)
++static inline double TAngle3Normalized(const Vec3d& a, const Vec3d& b, bool clampCosine = false)
+ {
+   /*
+    angle = atan2(a dot b, |a x b|) # Bertram (accidental mistake)
+@@ -79,7 +79,8 @@ static inline double TAngle3Normalized(const Vec3d& a, const Vec3d& b)
+    angle = acos(a dot b)           # Hamdi Sahloul (simplification, a & b are normalized)
+   */
+ 
+-  return acos(a.dot(b));
++  const double cosine = a.dot(b);
++  return acos(clampCosine ? std::max(-1.0, std::min(1.0, cosine)) : cosine);
+ }
+ 
+ static inline void rtToPose(const Matx33d& R, const Vec3d& t, Matx44d& Pose)
+@@ -190,10 +191,10 @@ static inline void eulerToDCM(const Vec3d& euler, Matx33d& R)
+ /**
+  *  \brief Compute the transformation needed to rotate n1 onto x axis and p1 to origin
+  */
+-static inline void computeTransformRT(const Vec3d& p1, const Vec3d& n1, Matx33d& R, Vec3d& t)
++static inline void computeTransformRT(const Vec3d& p1, const Vec3d& n1, Matx33d& R, Vec3d& t, bool clampCosine = false)
+ {
+   // dot product with x axis
+-  double angle = acos(n1[0]);
++  double angle = acos(clampCosine ? std::max(-1.0, std::min(1.0, n1[0])) : n1[0]);
+ 
+   // cross product with x axis
+   Vec3d axis(0, n1[2], -n1[1]);
+diff --git a/modules/surface_matching/src/ppf_match_3d.cpp b/modules/surface_matching/src/ppf_match_3d.cpp
+index 826b61ab2..8c0ab8b19 100644
+--- a/modules/surface_matching/src/ppf_match_3d.cpp
++++ b/modules/surface_matching/src/ppf_match_3d.cpp
+@@ -42,6 +42,8 @@
+ #include "hash_murmur.hpp"
+ #include "opencv2/surface_matching/t_hash_int.hpp"
+ 
++#include <cmath>
++#include <limits>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -112,13 +114,13 @@ static KeyType hashPPF(const Vec4d& f, const double AngleStep, const double Dist
+   return hashKey;
+ }*/
+ 
+-static double computeAlpha(const Vec3d& p1, const Vec3d& n1, const Vec3d& p2)
++static double computeAlpha(const Vec3d& p1, const Vec3d& n1, const Vec3d& p2, bool prepared)
+ {
+   Vec3d Tmg, mpt;
+   Matx33d R;
+   double alpha;
+ 
+-  computeTransformRT(p1, n1, R, Tmg);
++  computeTransformRT(p1, n1, R, Tmg, prepared);
+   mpt = Tmg + R * p2;
+   alpha=atan2(-mpt[2], mpt[1]);
+ 
+@@ -181,7 +183,7 @@ void PPF3DDetector::setSearchParams(const double positionThreshold, const double
+ // compute per point PPF as in paper
+ void PPF3DDetector::computePPFFeatures(const Vec3d& p1, const Vec3d& n1,
+                                        const Vec3d& p2, const Vec3d& n2,
+-                                       Vec4d& f)
++                                       Vec4d& f, bool prepared)
+ {
+   Vec3d d(p2 - p1);
+   f[3] = cv::norm(d);
+@@ -189,9 +191,9 @@ void PPF3DDetector::computePPFFeatures(const Vec3d& p1, const Vec3d& n1,
+     return;
+   d *= 1.0 / f[3];
+ 
+-  f[0] = TAngle3Normalized(n1, d);
+-  f[1] = TAngle3Normalized(n2, d);
+-  f[2] = TAngle3Normalized(n1, n2);
++  f[0] = TAngle3Normalized(n1, d, prepared);
++  f[1] = TAngle3Normalized(n2, d, prepared);
++  f[2] = TAngle3Normalized(n1, n2, prepared);
+ }
+ 
+ void PPF3DDetector::clearTrainingModels()
+@@ -224,8 +226,56 @@ void PPF3DDetector::trainModel(const Mat &PC)
+ 
+   Mat sampled = samplePCByQuantization(PC, xRange, yRange, zRange, (float)sampling_step_relative,0);
+ 
++  angle_step_radians = (360.0/angle_step_relative)*M_PI/180.0;
++  prepared_training = false;
++  trainPoints(sampled, distanceStep, false);
++}
++
++static void validatePreparedPoints(const Mat& points, double distanceBinMetres)
++{
++  CV_CheckTypeEQ(points.type(), CV_32FC1, "Prepared points must be CV_32FC1");
++  CV_Assert(points.dims == 2 && points.cols == 6 && points.rows >= 2);
++  CV_Assert(std::isfinite(distanceBinMetres) && distanceBinMetres > 0);
++  Vec3d low = Vec3d::all(std::numeric_limits<double>::max());
++  Vec3d high = Vec3d::all(-std::numeric_limits<double>::max());
++  for (int i = 0; i < points.rows; ++i)
++  {
++    const float* row = points.ptr<float>(i);
++    for (int j = 0; j < 6; ++j)
++      CV_Assert(std::isfinite(row[j]));
++    for (int j = 0; j < 3; ++j)
++    {
++      low[j] = std::min(low[j], static_cast<double>(row[j]));
++      high[j] = std::max(high[j], static_cast<double>(row[j]));
++    }
++    const Vec3d normal(row[3], row[4], row[5]);
++    CV_Assert(std::abs(normal.dot(normal) - 1.0) <= 1e-4);
++  }
++  // hashPPF converts the distance quotient to int. Reject an unsafe bin
++  // explicitly rather than overflowing or silently substituting a larger bin.
++  CV_Assert(norm(high - low) / distanceBinMetres < std::numeric_limits<int>::max());
++}
++
++void PPF3DDetector::trainPrepared(InputArray modelPoints, double distanceBinMetres, double numberOfAngles)
++{
++  const Mat points = modelPoints.getMat();
++  validatePreparedPoints(points, distanceBinMetres);
++  CV_Assert(std::isfinite(numberOfAngles) && numberOfAngles >= 1);
++  CV_Assert(numberOfAngles < std::numeric_limits<int>::max());
++  CV_Assert(static_cast<int64_t>(points.rows) * points.rows <= std::numeric_limits<int>::max());
++  CV_Assert(numberOfAngles * points.rows <= std::numeric_limits<int>::max());
++  // Own the exact rows, including separate normal groups at coincident points.
++  Mat ownedPoints = points.clone();
++  angle_step_radians = 2 * M_PI / numberOfAngles;
++  trainPoints(ownedPoints, distanceBinMetres, true);
++  prepared_training = true;
++}
++
++void PPF3DDetector::trainPoints(const Mat& sampled, double distanceStep, bool prepared)
++{
+   clearTrainingModels();
+   trained = false;
++  prepared_training = false;
+ 
+   int numPPF = sampled.rows*sampled.rows;
+   ppf = Mat(numPPF, PPF_LENGTH, CV_32FC1);
+@@ -254,9 +304,9 @@ void PPF3DDetector::trainModel(const Mat &PC)
+         const Vec3f n2(sampled.ptr<float>(j) + 3);
+ 
+         Vec4d f = Vec4d::all(0);
+-        computePPFFeatures(p1, n1, p2, n2, f);
++        computePPFFeatures(p1, n1, p2, n2, f, prepared);
+         KeyType hashValue = hashPPF(f, angle_step_radians, distanceStep);
+-        double alpha = computeAlpha(p1, n1, p2);
++        double alpha = computeAlpha(p1, n1, p2, prepared);
+         uint ppfInd = i*numRefPoints+j;
+ 
+         THash hashNode;
+@@ -435,24 +485,37 @@ void PPF3DDetector::match(const Mat& pc, std::vector<Pose3DPtr>& results, const
+ 
+   scene_sample_step = (int)(1.0/relativeSceneSampleStep);
+ 
+-  //int numNeighbors = 10;
+-  int numAngles = (int) (floor (2 * M_PI / angle_step));
+-  float distanceStep = (float)distance_step;
+-  uint n = num_ref_points;
+-  std::vector<Pose3DPtr> poseList;
+-  int sceneSamplingStep = scene_sample_step;
+-
+-  // compute bbox
+   Vec2f xRange, yRange, zRange;
+   computeBboxStd(pc, xRange, yRange, zRange);
+-
+-  // sample the point cloud
+-  /*float dx = xRange[1] - xRange[0];
+-  float dy = yRange[1] - yRange[0];
+-  float dz = zRange[1] - zRange[0];
+-  float diameter = sqrt ( dx * dx + dy * dy + dz * dz );
+-  float distanceSampleStep = diameter * RelativeSceneDistance;*/
+   Mat sampled = samplePCByQuantization(pc, xRange, yRange, zRange, (float)relativeSceneDistance, 0);
++  matchPoints(sampled, results, scene_sample_step, false);
++}
++
++void PPF3DDetector::matchPrepared(InputArray scenePoints, std::vector<Pose3DPtr>& results,
++                                  double sceneReferenceFraction, double distanceBinMetres)
++{
++  const Mat points = scenePoints.getMat();
++  validatePreparedPoints(points, distanceBinMetres);
++  CV_Assert(std::isfinite(sceneReferenceFraction) &&
++            sceneReferenceFraction > 0 && sceneReferenceFraction <= 1);
++  if (!trained || !prepared_training)
++    CV_Error(Error::StsError, "Call trainPrepared before matchPrepared");
++  if (distanceBinMetres != distance_step)
++    CV_Error(Error::StsBadArg, "distanceBinMetres must equal the training bin in metres");
++  // Clamp before conversion so tiny positive fractions remain well-defined.
++  const int stride = static_cast<int>(std::min(1.0 / sceneReferenceFraction,
++                                               static_cast<double>(points.rows)));
++  matchPoints(points, results, stride, true);
++}
++
++void PPF3DDetector::matchPoints(const Mat& sampled, std::vector<Pose3DPtr>& results,
++                              int sceneSamplingStep, bool prepared)
++{
++  CV_Assert(hash_table);
++  int numAngles = (int)(floor(2 * M_PI / angle_step));
++  const double distanceStep = prepared ? distance_step : (double)(float)distance_step;
++  uint n = num_ref_points;
++  std::vector<Pose3DPtr> poseList;
+ 
+   // allocate the accumulator : Moved this to the inside of the loop
+   /*#if !defined (_OPENMP)
+@@ -475,7 +538,7 @@ void PPF3DDetector::match(const Mat& pc, std::vector<Pose3DPtr>& results, const
+     Matx33d Rsg = Matx33d::all(0), RInv = Matx33d::all(0);
+ 
+     uint* accumulator = (uint*)calloc(numAngles*n, sizeof(uint));
+-    computeTransformRT(p1, n1, Rsg, tsg);
++    computeTransformRT(p1, n1, Rsg, tsg, prepared);
+ 
+     // Tolga Birdal's notice:
+     // As a later update, we might want to look into a local neighborhood only
+@@ -492,7 +555,7 @@ void PPF3DDetector::match(const Mat& pc, std::vector<Pose3DPtr>& results, const
+         double alpha_scene;
+ 
+         Vec4d f = Vec4d::all(0);
+-        computePPFFeatures(p1, n1, p2, n2, f);
++        computePPFFeatures(p1, n1, p2, n2, f, prepared);
+         KeyType hashValue = hashPPF(f, angle_step, distanceStep);
+ 
+         p2t = tsg + Rsg * Vec3d(p2);
+@@ -531,6 +594,8 @@ void PPF3DDetector::match(const Mat& pc, std::vector<Pose3DPtr>& results, const
+           //printf("%f\n", alpha);
+           int alpha_index = (int)(numAngles*(alpha + 2*M_PI) / (4*M_PI));
+ 
++          if (prepared)
++            alpha_index = std::min(numAngles - 1, std::max(0, alpha_index));
+           uint accIndex = corrI * numAngles + alpha_index;
+ 
+           accumulator[accIndex]++;
+@@ -572,7 +637,7 @@ void PPF3DDetector::match(const Mat& pc, std::vector<Pose3DPtr>& results, const
+     const Vec3f pMax(sampled_pc.ptr<float>(refIndMax));
+     const Vec3f nMax(sampled_pc.ptr<float>(refIndMax) + 3);
+ 
+-    computeTransformRT(pMax, nMax, Rmg, tmg);
++    computeTransformRT(pMax, nMax, Rmg, tmg, prepared);
+ 
+     Matx44d Tmg;
+     rtToPose(Rmg, tmg, Tmg);
+@@ -605,7 +670,7 @@ void PPF3DDetector::match(const Mat& pc, std::vector<Pose3DPtr>& results, const
+   // TODO : Make the parameters relative if not arguments.
+   //double MinMatchScore = 0.5;
+ 
+-  int numPosesAdded = sampled.rows/sceneSamplingStep;
++  int numPosesAdded = prepared ? static_cast<int>(poseList.size()) : sampled.rows/sceneSamplingStep;
+ 
+   clusterPoses(poseList, numPosesAdded, results);
+ }
