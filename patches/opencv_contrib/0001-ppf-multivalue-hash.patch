@@ -1,0 +1,189 @@
+diff --git a/modules/surface_matching/include/opencv2/surface_matching/ppf_match_3d.hpp b/modules/surface_matching/include/opencv2/surface_matching/ppf_match_3d.hpp
+index b967e6a69..f1c9d6e44 100644
+--- a/modules/surface_matching/include/opencv2/surface_matching/ppf_match_3d.hpp
++++ b/modules/surface_matching/include/opencv2/surface_matching/ppf_match_3d.hpp
+@@ -82,6 +82,9 @@ typedef struct THash
+   int i, ppfInd;
+ } THash;
+ 
++// PPF-only multi-value hash. Kept opaque so ICP can keep using t_hash_int.
++struct PPFHashTable;
++
+ /**
+   * @brief Class, allowing the load and matching 3D models.
+   * Typical Use:
+@@ -149,8 +152,7 @@ protected:
+   double sampling_step_relative, angle_step_relative, distance_step_relative;
+   Mat sampled_pc, ppf;
+   int num_ref_points;
+-  hashtable_int* hash_table;
+-  THash* hash_nodes;
++  PPFHashTable* hash_table;
+ 
+   double position_threshold, rotation_threshold;
+   bool use_weighted_avg;
+diff --git a/modules/surface_matching/src/ppf_match_3d.cpp b/modules/surface_matching/src/ppf_match_3d.cpp
+index 1c1a24729..826b61ab2 100644
+--- a/modules/surface_matching/src/ppf_match_3d.cpp
++++ b/modules/surface_matching/src/ppf_match_3d.cpp
+@@ -40,6 +40,10 @@
+ 
+ #include "precomp.hpp"
+ #include "hash_murmur.hpp"
++#include "opencv2/surface_matching/t_hash_int.hpp"
++
++#include <unordered_map>
++#include <vector>
+ 
+ namespace cv
+ {
+@@ -48,6 +52,19 @@ namespace ppf_match_3d
+ 
+ static const size_t PPF_LENGTH = 5;
+ 
++struct PPFKeyHash
++{
++  size_t operator()(KeyType key) const noexcept
++  {
++    return static_cast<size_t>(key);
++  }
++};
++
++struct PPFHashTable
++{
++  std::unordered_map<KeyType, std::vector<THash>, PPFKeyHash> buckets;
++};
++
+ // routines for assisting sort
+ static bool pose3DPtrCompare(const Pose3DPtr& a, const Pose3DPtr& b)
+ {
+@@ -127,7 +144,6 @@ PPF3DDetector::PPF3DDetector()
+   trained = false;
+ 
+   hash_table = NULL;
+-  hash_nodes = NULL;
+ 
+   setSearchParams();
+ }
+@@ -143,7 +159,6 @@ PPF3DDetector::PPF3DDetector(const double RelativeSamplingStep, const double Rel
+   trained = false;
+ 
+   hash_table = NULL;
+-  hash_nodes = NULL;
+ 
+   setSearchParams();
+ }
+@@ -181,17 +196,8 @@ void PPF3DDetector::computePPFFeatures(const Vec3d& p1, const Vec3d& n1,
+ 
+ void PPF3DDetector::clearTrainingModels()
+ {
+-  if (this->hash_nodes)
+-  {
+-    free(this->hash_nodes);
+-    this->hash_nodes=0;
+-  }
+-
+-  if (this->hash_table)
+-  {
+-    hashtableDestroy(this->hash_table);
+-    this->hash_table=0;
+-  }
++  delete this->hash_table;
++  this->hash_table=0;
+ }
+ 
+ PPF3DDetector::~PPF3DDetector()
+@@ -218,9 +224,8 @@ void PPF3DDetector::trainModel(const Mat &PC)
+ 
+   Mat sampled = samplePCByQuantization(PC, xRange, yRange, zRange, (float)sampling_step_relative,0);
+ 
+-  int size = sampled.rows*sampled.rows;
+-
+-  hashtable_int* hashTable = hashtableCreate(size, NULL);
++  clearTrainingModels();
++  trained = false;
+ 
+   int numPPF = sampled.rows*sampled.rows;
+   ppf = Mat(numPPF, PPF_LENGTH, CV_32FC1);
+@@ -228,14 +233,12 @@ void PPF3DDetector::trainModel(const Mat &PC)
+   // TODO: Maybe I could sample 1/5th of them here. Check the performance later.
+   int numRefPoints = sampled.rows;
+ 
+-  // pre-allocate the hash nodes
+-  hash_nodes = (THash*)calloc(numRefPoints*numRefPoints, sizeof(THash));
++  hash_table = new PPFHashTable();
++  hash_table->buckets.reserve(static_cast<size_t>(numRefPoints));
+ 
+-  // TODO : This can easily be parallelized. But we have to lock hashtable_insert.
+-  // I realized that performance drops when this loop is parallelized (unordered
+-  // inserts into the hashtable
+-  // But it is still there to be investigated. For now, I leave this unparallelized
+-  // since this is just a training part.
++  // hashtableInsertHashed walks a same-key chain on every insert (O(k^2) for
++  // a feature that appears k times) and overwrites colliding keys. PPF keeps
++  // every pair for a key and looks up by exact key, so ICP can keep t_hash_int.
+   for (int i=0; i<numRefPoints; i++)
+   {
+     const Vec3f p1(sampled.ptr<float>(i));
+@@ -256,12 +259,11 @@ void PPF3DDetector::trainModel(const Mat &PC)
+         double alpha = computeAlpha(p1, n1, p2);
+         uint ppfInd = i*numRefPoints+j;
+ 
+-        THash* hashNode = &hash_nodes[i*numRefPoints+j];
+-        hashNode->id = hashValue;
+-        hashNode->i = i;
+-        hashNode->ppfInd = ppfInd;
+-
+-        hashtableInsertHashed(hashTable, hashValue, (void*)hashNode);
++        THash hashNode;
++        hashNode.id = (int)hashValue;
++        hashNode.i = i;
++        hashNode.ppfInd = (int)ppfInd;
++        hash_table->buckets[hashValue].push_back(hashNode);
+ 
+         Mat(f).reshape(1, 1).convertTo(ppf.row(ppfInd).colRange(0, 4), CV_32F);
+         ppf.ptr<float>(ppfInd)[4] = (float)alpha;
+@@ -271,7 +273,6 @@ void PPF3DDetector::trainModel(const Mat &PC)
+ 
+   angle_step = angle_step_radians;
+   distance_step = distanceStep;
+-  hash_table = hashTable;
+   num_ref_points = numRefPoints;
+   sampled_pc = sampled;
+   trained = true;
+@@ -428,6 +429,7 @@ void PPF3DDetector::match(const Mat& pc, std::vector<Pose3DPtr>& results, const
+     throw cv::Exception(cv::Error::StsError, "The model is not trained. Cannot match without training", __FUNCTION__, __FILE__, __LINE__);
+   }
+ 
++  CV_Assert(hash_table);
+   CV_Assert(pc.type() == CV_32F || pc.type() == CV_32FC1);
+   CV_Assert(relativeSceneSampleStep<=1 && relativeSceneSampleStep>0);
+ 
+@@ -507,13 +509,14 @@ void PPF3DDetector::match(const Mat& pc, std::vector<Pose3DPtr>& results, const
+ 
+         alpha_scene=-alpha_scene;
+ 
+-        hashnode_i* node = hashtableGetBucketHashed(hash_table, (hashValue));
++        const auto found = hash_table->buckets.find(hashValue);
++        if (found == hash_table->buckets.end())
++          continue;
+ 
+-        while (node)
++        for (const THash& tData : found->second)
+         {
+-          THash* tData = (THash*) node->data;
+-          int corrI = (int)tData->i;
+-          int ppfInd = (int)tData->ppfInd;
++          int corrI = (int)tData.i;
++          int ppfInd = (int)tData.ppfInd;
+           float* ppfCorrScene = ppf.ptr<float>(ppfInd);
+           double alpha_model = (double)ppfCorrScene[PPF_LENGTH-1];
+           double alpha = alpha_model - alpha_scene;
+@@ -531,7 +534,6 @@ void PPF3DDetector::match(const Mat& pc, std::vector<Pose3DPtr>& results, const
+           uint accIndex = corrI * numAngles + alpha_index;
+ 
+           accumulator[accIndex]++;
+-          node = node->next;
+         }
+       }
+     }

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using OpenCvSharp.PpfMatch3D;
 using Xunit;
 
@@ -5,6 +6,38 @@ namespace OpenCvSharp.Tests.SurfaceMatching;
 
 public class PPF3DDetectorTest : TestBase
 {
+    [Fact]
+    public void TrainModelInsertsRepeatedFeaturesWithoutQuadraticScan()
+    {
+        using var model = CreateDenseSlopedPlane(width: 40, height: 32);
+        const double sampling = 0.03;
+        Cv2.PpfMatch3D.ComputeBboxStd(
+            model,
+            out var xRange,
+            out var yRange,
+            out var zRange);
+        using var sampled = Cv2.PpfMatch3D.SamplePCByQuantization(
+            model,
+            xRange,
+            yRange,
+            zRange,
+            sampleStepRelative: (float)sampling);
+
+        Assert.InRange(sampled.Rows, 400, 2500);
+
+        using var detector = new PPF3DDetector(
+            relativeSamplingStep: sampling,
+            relativeDistanceStep: sampling,
+            numberOfAngles: 30);
+        var stopwatch = Stopwatch.StartNew();
+        detector.TrainModel(model);
+        stopwatch.Stop();
+
+        Assert.True(
+            stopwatch.Elapsed < TimeSpan.FromSeconds(12),
+            $"TrainModel took {stopwatch.Elapsed.TotalSeconds:F1}s for {sampled.Rows} quantized points; the PPF hash insert is still scanning duplicate-key chains.");
+    }
+
     [Fact]
     public void TrainMatchAndRefinePoses()
     {
@@ -155,6 +188,37 @@ public class PPF3DDetectorTest : TestBase
                 points[index, 3] = -dzdx * inverseLength;
                 points[index, 4] = -dzdy * inverseLength;
                 points[index, 5] = inverseLength;
+                index++;
+            }
+        }
+
+        return Mat.FromArray(points);
+    }
+
+    private static Mat<float> CreateDenseSlopedPlane(int width, int height)
+    {
+        var points = new float[width * height, 6];
+        var index = 0;
+        var nx = -0.2f;
+        var ny = 0f;
+        var nz = 1f;
+        var inverseLength = 1f / MathF.Sqrt(nx * nx + ny * ny + nz * nz);
+        nx *= inverseLength;
+        ny *= inverseLength;
+        nz *= inverseLength;
+
+        for (var y = 0; y < height; y++)
+        {
+            var yf = y / (float)(height - 1);
+            for (var x = 0; x < width; x++)
+            {
+                var xf = x / (float)(width - 1);
+                points[index, 0] = xf;
+                points[index, 1] = yf;
+                points[index, 2] = 0.2f * xf;
+                points[index, 3] = nx;
+                points[index, 4] = ny;
+                points[index, 5] = nz;
                 index++;
             }
         }

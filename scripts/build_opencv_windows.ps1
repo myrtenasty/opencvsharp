@@ -54,6 +54,25 @@ if (-not (Test-Path "$RepoRoot/opencv_contrib/modules")) {
     throw "opencv_contrib submodule not found. Run: git submodule update --init --recursive"
 }
 
+# ---------------------------------------------------------------------------
+# Apply local opencv_contrib patches
+# ---------------------------------------------------------------------------
+$ppfHeader = "$RepoRoot/opencv_contrib/modules/surface_matching/include/opencv2/surface_matching/ppf_match_3d.hpp"
+$ppfPatch = "$RepoRoot/patches/opencv_contrib/0001-ppf-multivalue-hash.patch"
+if (Test-Path $ppfPatch) {
+    $alreadyApplied = Select-String -Path $ppfHeader -Pattern "struct PPFHashTable" -Quiet
+    if (-not $alreadyApplied) {
+        Write-Host "Applying opencv_contrib PPF multi-value hash patch ..."
+        git -C "$RepoRoot/opencv_contrib" apply --whitespace=nowarn $ppfPatch
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to apply $ppfPatch"
+        }
+    }
+    else {
+        Write-Host "PPF multi-value hash patch already present."
+    }
+}
+
 $OpenCvVersion = (git -C "$RepoRoot/opencv" describe --tags --exact-match 2>$null)
 if (-not $OpenCvVersion) { $OpenCvVersion = (git -C "$RepoRoot/opencv" rev-parse --short HEAD) }
 Write-Host "OpenCV version: $OpenCvVersion"
